@@ -1,0 +1,163 @@
+---
+title: "Legal LGBTI inclusivity in OECD countries"
+author: "MDSR-01"
+date: "2024-02-01"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+# show all code by default
+knitr::opts_chunk$set(echo = TRUE)
+
+# required packages
+library(ggtext)
+library(janitor)
+library(tidyverse)
+```
+
+This document contains [code by Georgios Karamanis][code-src], with slight changes to accommodate for the R Markdown format of the document.
+
+[code-src]: https://github.com/gkaramanis/30DayChartChallenge/tree/master/2022/day_18-OECD
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown, see <https://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button, a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r download-data}
+# local data filename
+f <- "data/oecd-inclusitivity.xlsx"
+# download data if missing
+if (!fs::file_exists(f)) {
+  download.file("https://stat.link/0ahtgn", f, mode = "wb", quiet = TRUE)
+}
+```
+
+The code chunk above downloads the data behind Figure 1.4 of this [analysis of legal LGBTI inclusivity as of 1999 and 2019 in OECD countries][data-src].
+
+[data-src]: https://www.oecd-ilibrary.org///sites/1d7a3c5d-en/index.html?itemId=/content/component/1d7a3c5d-en#figure-d1e805
+
+Place your mouse anywhere in the code chunk and then press `Shift-Cmd-Enter` to execute it.
+
+## Executing code chunks
+
+The next code chunk assumes that you have executed the previous one work. One option to execute it is to do so after asking for _all previous_ code chunks to be executed, which can be done with the `Alt-Shift-Cmd-P` keyboard shortcut.
+
+Yet another option is to select the previous code chunk, execute it with `Shift-Cmd-Enter`, and then press `Alt-Cmd-N` to execute the _next_ code chunk, i.e. the current one.
+
+(The keyboard shortcuts to execute code chunks in R Markdown might look a bit daunting, but you will get used to them pretty quickly. Check the 'Run' button in the toolbar above this window to revise them.)
+
+Now that you know how to execute code chunks, execute the next one:
+
+```{r prepare-demo-1, eval = FALSE}
+readxl::read_xlsx(f, sheet = 2, range = "A3:AK5") %>% 
+  mutate(OECD = rowMeans(select(., 3:last_col())))
+```
+
+When a code chunk is executed from within RStudio, its output will show beneath it. Compare the output of the chunk above to the output of the next code chunks, which each add some data preparation steps to it:
+
+```{r prepare-demo-2, eval = FALSE}
+readxl::read_xlsx(f, sheet = 2, range = "A3:AK5") %>% 
+  mutate(OECD = rowMeans(select(., 3:last_col()))) %>% 
+  rename(provisions = 1) %>% 
+  add_row(provisions = "All provisions", !!! colMeans(.[-1], na.rm = TRUE))
+```
+
+```{r prepare-demo-3, eval = FALSE}
+readxl::read_xlsx(f, sheet = 2, range = "A3:AK5") %>% 
+  mutate(OECD = rowMeans(select(., 3:last_col()))) %>% 
+  rename(provisions = 1) %>% 
+  add_row(provisions = "All provisions", !!! colMeans(.[-1], na.rm = TRUE)) %>% 
+  pivot_longer(2:last_col(), names_to = "country") %>% 
+  mutate(year = 2019, .before = 1)
+```
+
+You might have noticed that the code chunks above come with the `eval = FALSE` optional parameter. This ensures that the code chunks are _not_ executed when we will 'knit' the document into a Web page later on.
+
+## Actual data preparation
+
+The code chunk below actually performs the data preparation steps that we need to extract the 1999 and 2019 data that we are about to plot:
+
+```{r prepare-data, message = FALSE}
+# 2019
+incl_gen_2019 <- readxl::read_xlsx(f, sheet = 2, range = "A3:AK5") %>% 
+  mutate(OECD = rowMeans(select(., 3:last_col()))) %>% 
+  rename(provisions = 1) %>% 
+  add_row(provisions = "All provisions", !!! colMeans(.[-1], na.rm = TRUE)) %>% 
+  pivot_longer(2:last_col(), names_to = "country") %>% 
+  mutate(year = 2019, .before = 1)
+
+# 1999
+incl_gen_1999 <- readxl::read_xlsx(f, sheet = 2, range = "A34:AL36") %>% 
+  mutate(OECD = rowMeans(select(., 3:last_col()), na.rm = TRUE)) %>% 
+  janitor::remove_empty("cols") %>% 
+  select(1, OECD, everything()) %>% 
+  rename(provisions = 1) %>% 
+  add_row(provisions = "All provisions", !!! colMeans(.[-1], na.rm = TRUE)) %>% 
+  pivot_longer(2:last_col(), names_to = "country") %>% 
+  mutate(year = 1999, .before = 1)
+
+# filter each dataset to 'All provisions', and sort the first one by value
+all_2019 <- incl_gen_2019 %>% 
+  filter(base::startsWith(provisions, "All")) %>% 
+  mutate(country = forcats::fct_reorder(country, value))
+
+all_1999 <- incl_gen_1999 %>% 
+  filter(base::startsWith(provisions, "All")) 
+```
+
+This time, we used the `message = FALSE` to suppress some unnecessary output from executing the code. Try switching the parameter to `TRUE` and then re-execute the code to see what output was suppressed.
+
+At that stage, check the final data objects that we are about to plot. You can choose to execute the entire chunk below, or execute each of its lines separately, one after the next:
+
+```{r check-data, eval = FALSE}
+head(all_1999)
+head(all_2019)
+```
+
+## Data visualization
+
+The code below produces Georgios Karamanis' remix of the OECD figure cited earlier in this document, using `ggplot2` syntax:
+
+```{r viz, fig.dim = c(9, 11), echo = FALSE}
+ggplot() +
+  geom_col(data = all_2019, aes(value, country, fill = if_else(country != "OECD", "purple4", "orange3")), width = 0.8) +
+  geom_col(data = all_1999, aes(value, country, fill = if_else(country != "OECD", "#BC83FD", "#FCB651")), width = 0.3) +
+  scale_x_continuous(sec.axis = dup_axis(), breaks = seq(0, 1, 0.2), limits = c(0, 1), labels = scales::label_percent(scale = 100)) +
+  scale_fill_identity() +
+  labs(
+    title = "Legal LGBTI inclusivity is improving in all OECD countries",
+    subtitle = " % of LGBTI-inclusive laws that have been passed as of <span style = 'color:#BC83FD;'>**1999**</span> and <span style = 'color:purple4;'>**2019**</span>, by OECD country",
+    caption = "Source: OECD questionnaire on LGBTI-inclusive laws and policies (2019) · Graphic: Georgios Karamanis"
+  ) +
+  theme_minimal(base_family = "Arial", base_size = 18) +
+  theme(
+    plot.background = element_rect(fill = "grey99", color = NA),
+    axis.title = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.margin = margin(20, 30, 20, 30),
+    plot.subtitle = ggtext::element_markdown(size = 15, margin = margin(0, 0, 20, 0)),
+    plot.caption = element_text(margin = margin(30, 0, 0, 0), size = 12, hjust = 0),
+    plot.title.position = "plot",
+    plot.caption.position = "plot"
+  )
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk above to hide the R code when we will 'knit' the document in a minute.
+
+If you executed the above code chunk in RStudio, the plot must look very squished: use the 'Show in New Window' button on its top-right angle to expand and resize the plot window.
+
+For reference here's the original OECD figure:
+
+![Fig 1.4. from [OECD Web page source][data-src]](static/image5.png)
+
+## Knitting the document
+
+Press `Shift-Cmd-K` to knit the entire document into a Web page, and take a look at the result -- the plot above will have different (better) dimensions, which were passed with the `fig.dim` option. You can read more on that option [in the R Markdown docs](https://bookdown.org/yihui/rmarkdown-cookbook/figure-size.html).
+
+Alternatively, press `Alt-Cmd-R` to simply run all code chunks from within RStudio.
+
+* * *
+
+__Well done!__ You now know how to execute R Markdown from within RStudio, and how to generate a Web page from R code and Markdown syntax.

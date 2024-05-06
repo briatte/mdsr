@@ -1,0 +1,265 @@
+---
+title: "SQL queries on cabinet composition"
+author: "FB"
+date: "2024-02-16"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    highlight: kate
+    theme: yeti
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This document will show you how to use the `DBI` package in order to use [SQL](https://en.wikipedia.org/wiki/SQL) syntax from within R on an example SQL database. The example is the [ParlGov](https://parlgov.org/) database, which is available in [SQLite](https://www.sqlite.org/) format.
+
+```{r packages, message=FALSE}
+library(DBI)       # the database backend
+library(RSQLite)   # the database driver for SQLite
+library(tidyverse) # mostly for `dplyr`
+```
+
+Part of the code below was remixed from an [example script by Holger Döring](https://github.com/hdigital/parlgov-snippets/blob/main/country-year/country-year.R).
+
+## Creating a database connection
+
+The first step with any database is to create a 'connection' to it:
+
+```{r pressure}
+pg_sqlite <- DBI::dbConnect(RSQLite::SQLite(), "data/parlgov-development.db")
+pg_sqlite
+```
+
+None of the data are actually loaded in memory at that stage: the connection simply points to it. The more general logic behind SQL is that it has the capacity to access data and compute things "outside of RAM," which means that it can handle very large databases that would not fit into the live memory of your computer if you tried loading them as e.g. CSV files.
+
+Once the connection is established, the different parts of the database can be queried:
+
+```{r list-tables}
+# list all tables
+DBI::dbListTables(pg_sqlite)
+```
+
+Each component is a table, and tables will often 'connect' with each other via common identifiers that repeat from one table to the next. Note the repetition of the `party_id` identifier in both tables below:
+
+```{r list-fields}
+# understand what a table contains
+DBI::dbListFields(pg_sqlite, "view_party")
+DBI::dbListFields(pg_sqlite, "view_cabinet")
+```
+
+The way in which all tables 'connect' (or not) to each other is called the [database schema](https://en.wikipedia.org/wiki/Database_schema).
+
+## Looking at the data in a table
+
+One way to look at a database table is to stop using `DBI` and to switch to `dplyr`, through the `tbl` function:
+
+```{r tbl}
+tbl(pg_sqlite, "view_cabinet") %>% 
+  head()
+```
+
+Note that this function scans the data from 'within' the database, *without importing them in R*. This is why the number of rows in the result below is undefined, because the function did not load the entire table:
+
+```{r tbl-nrow}
+tbl(pg_sqlite, "view_cabinet") %>%
+  nrow()
+```
+
+This is not very important when the table can easily fit into memory, as is the case here. However, if the table has millions or billions of rows, then it becomes very interesting to proceed that way. This is one of the main reasons to use SQL, which is also a very stable query language and data format.
+
+## Collecting a table
+
+To get the data from a table into R, all you need to do is to 'collect' it from the database:
+
+```{r collect}
+# 'collect' the table into a data frame
+cabinets <- collect(tbl(pg_sqlite, "view_cabinet"))
+# the number of rows is now available
+nrow(cabinets)
+```
+
+And now that you have done so, all `dplyr` verbs (functions) are available as with any standard data frame:
+
+```{r recent-german-cabinets}
+cabinets %>%
+  # select only cabinet parties
+  filter(cabinet_party == 1) %>%
+  # compute cabinet seat shares
+  group_by(country_id, cabinet_id) %>%
+  mutate(cabinet_share = round(100 * seats / sum(seats), 1),
+         party_name = str_trunc(party_name, 30)) %>%
+  ungroup() %>% 
+  # example result: last three German cabinets
+  filter(country_name == "Germany") %>%
+  select(country_name, start_date, party_name, cabinet_share) %>% 
+  group_by(start_date) %>%
+  group_split() %>%
+  tail(3)
+```
+
+Note that _some_ `dplyr` functions do not require collecting the data, and can be used directly onto the database:
+
+```{r dplyr-with-tbl}
+tbl(pg_sqlite, "view_cabinet") %>% 
+  pull(country_id) %>% 
+  n_distinct()
+```
+
+This blurs the distinction between what is happening in SQL, and what is happening in R. However, this is useful if you are querying a very large database, as it becomes possible to do so from within SQL, and then to postprocess the (smaller) result from R.
+
+## Using SQL syntax
+
+SQL is not just a way to store data: it is also a way to access the data by writing queries. Here is an example query:
+
+```{sql example-query, eval=FALSE}
+SELECT * FROM view_cabinet;
+```
+
+... which means: "select every column in the `view_cabinet` table." The uppercase is optional -- I am using it only to emphasize the SQL clauses [`SELECT`](https://www.sqlite.org/lang_select.html) and `FROM` in the query. As for the semicolon, it is required to separate queries if you are using SQL from the command line, but can be omitted otherwise.
+
+(Note in passing that the code above got syntax-highlighted by R Markdown, because it understands many other language syntaxes beyond R. Check how this is done in the `.Rmd` source document by looking at the `example-query` code chunk, which starts with `sql` instead of `r`.)
+
+SQL queries can be passed in R by using the `DBI` package:
+
+```{r sql-with-DBI}
+DBI::dbGetQuery(pg_sqlite, "SELECT * FROM view_cabinet") %>%
+  glimpse()
+```
+
+The same query can also be passed with the `dplyr` package, by combining the `tbl` and `sql` functions as follows:
+
+```{r sql-with-dplyr, eval=FALSE}
+tbl(pg_sqlite, sql("SELECT * FROM view_cabinet")) %>%
+  glimpse()
+```
+
+SQL queries can span over multiple lines when they become more complex. Here is an example, which selects and renames columns from the `view_cabinet` table:
+
+```{r sql-select-rename}
+# selecting/renaming columns
+"SELECT country_name AS country, cabinet_id, seats
+FROM view_cabinet" %>%
+  DBI::dbGetQuery(pg_sqlite, .) %>%
+  glimpse()
+```
+
+On top of that, SQL queries can also include comments:
+
+```{sql example-long-query, eval=FALSE}
+-- Example multi-line SQL query
+SELECT country_name, cabinet_name, party_id, seats, start_date
+FROM view_cabinet
+-- Limit results to two countries
+WHERE country_name IN ('Austria', 'Belgium') AND
+-- Limit results to years 1990 onwards
+election_date > '1990-01-01' AND
+-- Limit results to cabinet parties
+cabinet_party == 1 AND
+-- Limit results to rows with non-missing seats
+seats IS NOT NULL
+-- Sort results by ascending date and descending seats
+ORDER BY start_date ASC, seats DESC
+-- Show only first 10 results
+LIMIT 10"
+```
+
+Note that SQL clauses are written in a fixed order: `SELECT`, `FROM`, `WHERE`, and then `ORDER BY`.
+
+Below are the first 10 lines produced by the query above:
+
+```{r sql-commented}
+"SELECT country_name, cabinet_name, party_id, seats, start_date
+FROM view_cabinet
+WHERE country_name IN ('Austria', 'Belgium') AND
+election_date > '1990-01-01' AND
+cabinet_party == 1 AND
+seats IS NOT NULL
+ORDER BY start_date ASC, seats DESC
+LIMIT 10" %>%
+  DBI::dbGetQuery(pg_sqlite, .)
+```
+
+Remember that everything above is happening through a database query: the data have not been imported into R, and are being read directly from the database. This makes it possible to extract just a few lines of data from a very large dataset without having to load the entire dataset into memory first.
+
+## Aggregation and summary statistics
+
+In a previous section, I showed the following code example, which extracts the `country_id` column (variable) from the `view_cabinet` table, and then counts the number of distinct elements (values) that it contains:
+
+```{r dplyr-with-tbl-repeated}
+tbl(pg_sqlite, "view_cabinet") %>% 
+  pull(country_id) %>% 
+  n_distinct()
+```
+
+The `n_distinct` function aggregates the data by unique values. An equivalent in base R would be to use the following:
+
+```{r n_distinct}
+tbl(pg_sqlite, "view_cabinet") %>% 
+  pull(country_id) %>% 
+  unique() %>% 
+  length()
+```
+
+Yet another way to obtain the same result is to use the `distinct` function from `dplyr`, and then to aggregate its result with the `count` function:
+
+```{r distinct-count}
+# using `distinct` alone
+tbl(pg_sqlite, "view_cabinet") %>%
+  distinct(country_name) %>%
+  head()
+# using `distinct` + `count`
+tbl(pg_sqlite, "view_cabinet") %>%
+  distinct(country_name) %>%
+  count()
+```
+
+If you followed the logic of the operations above, then the following SQL query will also make sense to you:
+
+```{r count-distinct}
+"SELECT COUNT(DISTINCT country_name)
+FROM view_cabinet" %>% 
+  sql() %>% 
+  tbl(pg_sqlite, .)
+```
+
+(Note that I am not calling the `DBI::dbGetQuery` function any more, and am using the equivalent `dplyr` functions instead. Also remember that in both cases, all computations are happening within the database, outside of RAM.)
+
+SQL offers many ways to aggregate your data, including through summary statistics:
+
+```{r summary-stats}
+"SELECT country_name, MIN(start_date), MAX(start_date), MEDIAN(start_date) 
+FROM view_cabinet 
+GROUP BY country_name
+LIMIT 5" %>%
+  sql() %>% 
+  tbl(pg_sqlite, .)
+```
+
+Apart from summary statistics, the SQL query above introduces the essential `GROUP BY` clause, which caused the statistics to be computed for each country, rather than over the entire table.
+
+Finally, let's use the `COUNT`, `DISTINCT` and `GROUP BY` clauses to ask for the number of distinct cabinets per country, and let's then use the `HAVING` clause to filter the results of that aggregation, which we will also sort:
+
+```{r having}
+"SELECT country_name, COUNT(DISTINCT cabinet_id) AS n_cabinets
+FROM view_cabinet
+GROUP BY country_name
+HAVING n_cabinets > 75
+ORDER BY n_cabinets DESC" %>%
+  sql() %>% 
+  tbl(pg_sqlite, .)
+```
+
+This last example shows you how powerful SQL can be to 'count and sort' things. 
+
+The same operation on several billions of rows would not have taken much longer. If we had been using such a large database, we would have been able to work from that database using the syntax shown above, and only then 'collect' the (much smaller) final result as a data frame in R.
+
+## Closing a database connection
+
+When done with a database, terminate your connection to it:
+
+```{r disconnect}
+DBI::dbDisconnect(pg_sqlite)
+```

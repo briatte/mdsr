@@ -1,0 +1,271 @@
+---
+title: "Worldwide impact of female education on fertility rates"
+author: "MDSR-05"
+date: "2024-03-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = 'center')
+```
+
+This session is an introduction to __linear regression models__. I will assume that you have studied such models before, and will only cover how to estimate such models in R. If you _do_ need a deeper refresher on the topic, please let me know, but first turn to the readings cited at the end of my slides, as well as to the resources listed in [this reading list, Section 8](https://github.com/briatte/dsr/wiki/Readings#8-regression).
+
+This introduction covers multiple linear regression on cross-sectional data, and future sessions will cover other kinds of data, as well as more advanced ways to format regression results.
+
+## Required packages
+
+We will use the very handy [`broom` package][broom], which provides helper functions to manipulate regression model results, as well as the `texreg` package, which provides several ways to format regression model results, the [`performance` package][performance], which provides additional helper functions to get goodness-of-fit metrics and post-estimation statistics out of statistical models, and the [`modelsummary` package][modelsummary], which produces many different kinds of tables:
+
+```{r packages, message = FALSE}
+library(broom)
+library(modelsummary)
+library(performance)
+library(texreg)
+library(tidyverse)
+```
+
+[broom]: https://broom.tidymodels.org/
+[modelsummary]: https://modelsummary.com/
+[performance]: https://easystats.github.io/performance/
+
+Reading the documentation of the packages listed above will be essential if you plan to use them in your own research projects, especially when you will get to the stage of finalising your projects into a publication-ready document.
+
+This session is also an introduction to using __Stata datasets__ within R. For that, we will use the [`haven` package][haven], which is part of the `tidyverse` bundle, but is not loaded by default. Let's do that right now:
+
+```{r haven}
+library(haven)
+```
+
+[haven]: https://haven.tidyverse.org/
+
+## About the dataset
+
+Last, this session is an introduction to the __[Quality of Government Standard dataset][qog-data]__, which is one of the datasets that I recommend using for your research projects. Note, however, that this demo uses the cross-sectional version of the dataset: for your own research, I recommend using the time series version, which we will use in a future session.
+
+[qog-data]: https://www.gu.se/en/quality-government/qog-data
+
+Because the [codebook of the dataset][qog-codebook] is a very large file, it is not included in this folder, but feel free, of course, to download it, in order to get a list of all variables, details on the sampling strategy, and explanations on what distinguishes the times series version of the dataset from the cross-sectional one.
+
+[qog-codebook]: https://www.qogdata.pol.gu.se/data/codebook_std_jan24.pdf
+
+Also note, in passing, that there are several other datasets available on the Quality of Government (QOG) website, some of which are more focused than the Standard one. Feel free to use any of those other datasets for your own research projects: all of them are high quality and well-documented.
+
+Let's now load the data:
+
+```{r data}
+qog <- haven::read_dta("data/qog_std_cs_jan24_stata14.dta")
+
+# total number of observations before handling missing values
+nrow(qog)
+```
+
+## Research design
+
+Since we will be working on a linear regression model, the equation that we will fit will be of the following form:
+
+$$Y = \alpha + \beta_1 X_1 + \beta_2 X_2 + , \ldots , + \beta_k X_k + \epsilon$$
+
+... where $Y$ stands for our dependent variable, which will be the __fertility rate__ of the countries under observation, and $X_1, X_2, \ldots, X_k$ stand for our independent variables (a.k.a. predictors). The predictors that we will use are: 
+
+- __Secondary education school enrolment rate of females__, which is measured as a percentage;
+- __GDP per capita__, which we will log in order to bring it closer to the normal distribution;
+- __Democratic status__ and __former colonial status__, which are both measured as binary (0/1) variables, a.k.a. 'dummies'; and
+- __Lifetime risk of maternal death__, which is the probability of dying from a maternal cause for 15-year-old females, and which we will also log.
+
+The variable recodes below handle all steps described above. We further reduce the dataset to just the variables that we will need for the forthcoming analysis:
+
+```{r data-preparation}
+qog_selection <- qog %>% 
+  mutate(
+    democratic = as.integer(br_dem == 1),
+    former_colony = as.integer(ht_colonial != 0),
+    log_gdpc = log(wdi_gdpcappppcur),
+    log_matdeath = log(wdi_lrmd)
+  ) %>% 
+  select(ccodealp, wdi_fertility, wdi_nersf, democratic, former_colony,
+         starts_with("log_"))
+
+# quick inspection of the data
+glimpse(qog_selection)
+```
+
+All variables come from the QOG dataset, although in your own research designs, you are welcome to use variables from other data sources by merging them with the QOG dataset, which contains several country-level identifiers, such as `ISO-3C` codes, to help with that operation. Also make sure to cite the _original_ data sources of the QOG variables that you use, as provided by the dataset codebook.
+
+Note that since we are using the cross-sectional version of the data, the variables are measured over several years and then averaged over that period.
+
+### Notes on data description
+
+Note that, in the context of a research project, you might prefer to look at your data through a publication-ready __summary statistics table__, such as the following one, which is produced by the [`modelsummary` package][modelsummary]:
+
+```{r datasummary, message = FALSE}
+modelsummary::datasummary(All(qog_selection) ~ N + Mean + SD + Min + Max, 
+                          data = qog_selection)
+```
+
+Before publication, the table might be improved by using proper variable labels.
+
+Also note that you will need to understand the __pattern of missing values__ in your data in order to sort out what your final sample size is. There are a lot of missing values in our female education variable, which means that our models will run only on a small subset of the QOG sample:
+
+```{r missing-values}
+# missing values per column (variable)
+colSums(map_dfr(qog_selection, ~ is.na(.x)))
+
+# missing values as a percentage of observations
+100 * (colSums(map_dfr(qog_selection, ~ is.na(.x))) / nrow(qog_selection)) %>% 
+  round(3)
+
+# final sample size (complete observations)
+d <- na.omit(qog_selection)
+nrow(d)
+```
+
+In a more elaborate analysis, we would likely look for a variable with better sample coverage (i.e. a variable available for a higher number of observations), or at least compare the geographic distribution of our final sample to that of the original dataset, in order to understand the extent of __sampling bias__ and subsequent loss of __representativeness__ that our variable selection might have introduced, if the missing variables are not [missing at random](https://en.wikipedia.org/wiki/Missing_data).
+
+## Regression models
+
+Let's now turn to our regression models, all of which focus on modelling the effect of female education (`wdi_nersf`) on the fertility rate (`wdi_fertility`), while controlling for the other predictors that we listed previously. The general relationship under study is the following one:
+
+```{r bivariate-relationship}
+ggplot(d, aes(y = wdi_fertility, x = wdi_nersf)) +
+  geom_text(aes(label = ccodealp)) +
+  labs(y = "Fertility rate (births/woman)", x = "Female sec. schooling (%)")
+```
+
+The correlation coefficient for the bivariate relationship is `r round(cor(d$wdi_fertility, d$wdi_nersf, use = "complete"), 2)`, which is very high. Note, though, the slightly nonlinear nature of the relationship, which would deserve to be highlighted in the plot above:
+
+```{r bivariate-relationship-expanded}
+# linear fit
+ggplot(d, aes(y = wdi_fertility, x = wdi_nersf)) +
+  geom_smooth(method = "lm") +
+  geom_text(aes(label = ccodealp))
+
+# nonlinear fit
+ggplot(d, aes(y = wdi_fertility, x = wdi_nersf)) +
+  geom_smooth(method = "loess") +
+  geom_text(aes(label = ccodealp))
+```
+
+Let's now estimate the effect observed above, with a variety of controls that we will interact together for some of them, by asking for their product ($X_1 \times X_2$), sometimes alongside the inclusion of the predictors alone. Note the syntax variations used below, and how they affect the model equation, as shown in the results:
+
+```{r models}
+# bivariate model
+m0 <- lm(wdi_fertility ~ wdi_nersf, data = d)
+summary(m0)
+
+# multiple linear regression models
+m1 <- lm(wdi_fertility ~ 
+           wdi_nersf + democratic + former_colony + log_gdpc + log_matdeath,
+         data = d)
+
+m2 <- lm(wdi_fertility ~ 
+           wdi_nersf + democratic:former_colony + log_gdpc + log_matdeath,
+         data = d)
+
+m3 <- lm(wdi_fertility ~ 
+           wdi_nersf + democratic * former_colony + log_gdpc + log_matdeath,
+         data = d)
+
+texreg::screenreg(list(m1, m2, m3))
+```
+
+The code above first uses the standard `summary` function on the bivariate model, and then turns to the `screenreg` function of the `texreg` package in order to produce a side-by-side summary of the model results that we are interested in reporting. In the context of an R Markdown document that we plan to output as HTML, turning these models into a table is easily done with the `knitreg` function of that same package:
+
+```{r htmlreg, results = 'asis'}
+texreg::knitreg(list(m1, m2, m3),
+                omit.coef = "(Intercept)",
+                caption = "Regression results")
+```
+
+The `screenreg`, `htmlreg` and `knitreg` functions of the `texreg` all deserve your attention for the production of your final research project reports. Alternatively, you might want to dig into the functions of the aforementioned `modelsummary` package, which is also a very good choice to output publication-ready regression tables, as below:
+
+```{r modelsummary}
+modelsummary::modelsummary(list(m1, m2, m3),
+                           shape = term + statistic ~ model,
+                           stars = TRUE,
+                           coef_omit = "(Intercept)",
+                           gof_map = c("nobs", "rmse"),
+                           title = "Regression results",
+                           notes = "Intercept omitted.")
+```
+
+That same package also has a powerful plotting function aimed at displaying regression results like ours:
+
+```{r modelplot}
+modelsummary::modelplot(list(m1, m2, m3), coef_omit = "Inter") +
+    geom_vline(xintercept = 0, lty = "dotted")
+```
+
+## Post-estimation statistics
+
+The tables shown above include a few common goodness-of-fit indicators. Use the [`performance` package][performance] if you want to access more of these:
+
+```{r performance}
+# single model
+performance::model_performance(m0)
+
+# multiple models, selected columns
+performance::compare_performance(list(m1, m2, m3)) %>% 
+  select(Name, BIC, R2_adjusted, RMSE, Sigma)
+```
+
+That same package also contains some functions to explore other post-estimation statistics, such as variance inflation factors (VIFs):
+
+```{r vif}
+# full results
+performance::multicollinearity(m1)
+
+# selected columns
+performance::multicollinearity(m3) %>% 
+  select(Term, VIF, Tolerance)
+```
+
+In addition to such statistics, it always makes sense to check the __distribution of the residuals__ ($Y - \hat Y$), in order to understand what kind of error your models have produced (remember: all models are wrong). Let's check the residuals of the first multiple regression model that we estimated:
+
+```{r residuals-m1}
+m1_error <- residuals(m1)
+hist(m1_error, breaks = 15, main = "Residuals of Model 1", xlab = NULL)
+```
+
+(Note that the plot above uses base R graphics instead of `ggplot2`, as I usually do. In this particular case, base R is faster and sufficiently clear to be used.)
+
+### Residuals inspection
+
+A few residuals are particularly high, especially on the positive side. Let's find out more about these, using the [`broom` package][broom] to collate the residuals to the original data:
+
+```{r broom-residuals}
+# basic use of the `broom` package
+broom::tidy(m1)
+broom::glance(m1)
+
+# collate model results to original data
+broom::augment(m1, d) %>% 
+  # select fitted values and residuals
+  select(ccodealp, wdi_fertility, .fitted, .resid) %>% 
+  # show 5 random rows
+  dplyr::sample_n(5)
+```
+
+Using that package makes it easy to produce a residuals-versus-fitted plot, which highlights some characteristics of Model 1:
+
+```{r rvf}
+# collate residuals to original data
+broom::augment(m1, d) %>% 
+  select(ccodealp, .fitted, .std.resid) %>% 
+  ggplot(aes(y = .std.resid, x = .fitted)) +
+  geom_text(aes(label = ccodealp, color = abs(.std.resid) < 2)) +
+  geom_hline(yintercept = 0, lty = "dotted") +
+  guides(color = "none")
+```
+
+As with the previous packages, I highly recommend checking the documentation of the `tidy` function of the `broom` package to better understand what columns were produced above, and what we then did with them. A good reading on the topic is [chapter 6](https://socviz.co/modeling.html) of Kieran Healy's _Data Visualization_ handbook, which I already referred to in an earlier session.
+
+Yet another package that we will later use for similar purposes is the [`ggfortify` package][ggfortify] package, but I am deliberately keeping this one out of this demo in order to keep the package installation list to the bare essentials. (The same principle might lead you to use _either_ the `texreg` package _or_ the `modelsummary` package in your own code.)
+
+[ggfortify]: https://cran.r-project.org/web/packages/ggfortify/vignettes/plot_lm.html
+
+---
+
+__This file should get you started with your first draft:__ explore the suggested datasets mentioned in my email (both the country-level ones and the survey ones), and start drafting a research design as shown above. You do _not_ need to produce regression models in your first draft: instead, work on understanding, recoding (and possibly transforming) the variables, on understanding your sample and final sample size, and on producing a clean HTML document from an R Markdown source.
+
+I will provide feedback on your drafts by suggesting a modelling strategy as well as some functions to improve the output.

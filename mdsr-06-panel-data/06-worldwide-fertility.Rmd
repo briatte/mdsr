@@ -1,0 +1,272 @@
+---
+title: "Worldwide impact of female education on fertility rates (continued)"
+author: "MDSR-06"
+date: "2024-03-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = 'center')
+```
+
+This sessione expands on the previous one by presenting a few ways to estimate __linear models with panel data__ and __cluster-robust standard errors__ in R, which is one of the standard modelling strategies that you often encounter in applied economics.
+
+We will focus on __fixed-effects models__, which remove within-unit variation in panel data with repeated observations of units like individuals or countries, over a time period such as survey waves or years. For a good introduction to the logic behind these models, see [Nick Huntington-Klein's book chapter][nhk16] on the topic.
+
+[nhk16]: https://theeffectbook.net/ch-FixedEffects.html
+
+## Required packages
+
+A lot of the packages that we will use were introduced last week:
+
+```{r packages-1, message = FALSE}
+library(broom)
+library(modelsummary)
+library(texreg)
+library(tidyverse)
+```
+
+To implement fixed-effects panel models, we will introduce two additional packages. The first one that we will use is the [`plm` package][plm], which is very well documented through a [companion book][plm-book] by its authors. The most flexible implementation of these models, however, will come from the more recent [`fixest` package][fixest], which is still in its version 0.x stage.
+
+[plm]: https://cran.r-project.org/package=plm
+[plm-book]: https://onlinelibrary.wiley.com/doi/book/10.1002/9781119504641
+[fixest]: https://lrberge.github.io/fixest/index.html
+
+```{r packages-2, message = FALSE}
+library(lmtest)
+library(fixest)
+library(plm)
+```
+
+Note that we also load the `lmtest` package above, which is commonly used to visualize linear models after performing various standard error corrections. The rationale for doing so is also well explained in Nick Huntington-Klein's _The Effect_ book (['Your Standard Errors are Probably Wrong'][nhk13-se]).
+
+[nhk13-se]: https://theeffectbook.net/ch-StatisticalAdjustment.html#your-standard-errors-are-probably-wrong
+
+## About the dataset
+
+This session uses the same __[Quality of Government Standard dataset][qog-data]__ that we used last week, except this time, we will load the time series version of the data in order to analyse country-year dyads instead of a single cross-section:
+
+```{r data}
+qog <- haven::read_dta("data/qog_std_ts_jan24_stata14.dta")
+
+# total number of N observations (before handling missing values)
+nrow(qog)
+
+# total number of G groups/units (countries)
+nrow(count(qog, ccodealp))
+
+# total number of T time periods/points (years)
+nrow(count(qog, year))
+```
+
+[qog-data]: https://www.gu.se/en/quality-government/qog-data
+
+The variable recodes below are identical to those that we performed last week, except we now have to deal with the distribution of missing values over time, which in this case will produce an __unbalanced panel__ structure:
+
+```{r data-preparation}
+# variable recodes
+qog_selection <- qog %>% 
+  mutate(
+    democratic = as.integer(br_dem == 1),
+    former_colony = as.integer(ht_colonial != 0),
+    log_gdpc = log(wdi_gdpcappppcur),
+    log_matdeath = log(wdi_lrmd)
+  ) %>% 
+  select(ccodealp, year, wdi_fertility, wdi_nersf, democratic, former_colony,
+         starts_with("log_"))
+
+# quick inspection of the data
+glimpse(qog_selection)
+
+# unbalanced panel data structure
+drop_na(qog_selection) %>% 
+  group_by(ccodealp) %>% 
+  summarise(n_yrs = n_distinct(year), 
+            min_yr = min(year), 
+            max_yr = max(year)) %>% 
+  sample_n(10)
+
+# final sample size (complete observations)
+d <- drop_na(qog_selection)
+
+# N observations
+nrow(d)
+# G units
+n_distinct(d$ccodealp)
+# T time points
+n_distinct(d$year)
+```
+
+## Linear model estimations
+
+As an introduction to the effects that we will estimate later, let's actually look at some plain linear models of the data. The code below fits a bivariate model of female education onto fertility (`wdi_fertility ~ wdi_nersf`) for each year of the data that contains at least three countries:
+
+```{r ols-by-year}
+ols_coefs <- group_by(d, year) %>%
+  # estimate model only for years with at least 3 countries
+  filter(n() > 2) %>% 
+  summarise(
+    n = n(),
+    # intercept (female education set at zero)
+    b0 = coef(lm(wdi_fertility ~ wdi_nersf))[ 1 ],
+    # coefficient for female education
+    b1 = coef(lm(wdi_fertility ~ wdi_nersf))[ 2 ],
+    # upper and lower confidence bounds
+    hi95_b0 = confint(lm(wdi_fertility ~ wdi_nersf))[ 1, 1 ],
+    lo95_b0 = confint(lm(wdi_fertility ~ wdi_nersf))[ 1, 2 ],
+    hi95_b1 = confint(lm(wdi_fertility ~ wdi_nersf))[ 2, 1 ],
+    lo95_b1 = confint(lm(wdi_fertility ~ wdi_nersf))[ 2, 2 ]
+  )
+
+tail(ols_coefs, 5)
+```
+
+This approach allows you to look at the estimated effect of the main predictor of our model in each year of the data. The effect is consistently negative, as expected:
+
+```{r ols-by-year-b1}
+ggplot(ols_coefs, aes(y = b1, x = year)) +
+  geom_pointrange(aes(y = b1, ymin = lo95_b1, ymax = hi95_b1)) +
+  geom_hline(yintercept = 0, lty = "dashed")
+```
+
+Note, however, that the intercept of our models varies by year, which means that what we just looked at is a comparison based on different 'baseline' values of fertility in each year:
+
+```{r ols-by-year-b0}
+ggplot(ols_coefs, aes(y = b0, x = year)) +
+  geom_pointrange(aes(y = b0, ymin = lo95_b0, ymax = hi95_b0)) +
+  geom_hline(yintercept = 0, lty = "dashed")
+```
+
+## Pooled linear regression
+
+Let's now introduce the full model equation, and then fit it through (1) a pooled linear regression, and (2) another pooled linear regression, in which we introduce a separate intercept for each country:
+
+```{r models}
+eqn <- formula(wdi_fertility ~ 
+                 wdi_nersf + democratic + former_colony + 
+                 log_gdpc + log_matdeath)
+
+base_lm <- lm(eqn, data = d)
+
+base_lsdv <- lm(update.formula(eqn, ~ . + ccodealp), data = d)
+```
+
+Our first model is a 'naive' OLS estimator of the model that we want to fit, which just ignores the panel data structure, whereas the second model is a Least Squares Dummy Variables (LSDV) model that will provide a regression coefficient for all units (countries) at the exception of one:
+
+```{r lsdv-results}
+broom::tidy(base_lsdv)
+```
+
+## Fixed-effects estimation with `plm`
+
+To estimate a fixed-effects model to the same data, we will now turn to the [`plm` package][plm], which first requires declaring our data to be a panel where the `ccodealp` defines the 'individual' group/unit, and where the `year` variable defines the time period/point:
+
+```{r, plm-data}
+d_plm <- plm::pdata.frame(d, index = c("ccodealp", "year"))
+```
+
+Our data are still a standard `data.frame` with a few more attributes (panel characteristics). Declaring the data can be done on-the-fly while estimating the models, but prior declaration avoids forgetting to do so, and might come in handy if you want to later submit the data to tests, such as a test for unbalancedness:
+
+```{r, plm-balancedness}
+plm::is.pbalanced(d_plm)
+plm::punbalancedness(d_plm) # ?punbalancedness
+```
+
+Using that data frame and the model equation that we defined earlier, we can now fit a variety of models through the main, eponymous function of the `plm` package. The package can replicate what we did with base R:
+
+```{r, plm-models-1}
+# pooled OLS (identical to base_lm above)
+plm_lm <- plm::plm(eqn, model = "pooling", data = d_plm)
+# LSDV (identical to base_lsdv above)
+plm_lsdv <- plm::plm(update.formula(eqn, ~ . + ccodealp),
+                     model = "pooling", data = d_plm)
+```
+
+... or, much more interestingly, can estimate the kinds of fixed-effects models that we discussed earlier:
+
+```{r, plm-models-2}
+# first-differences
+plm_fd <- plm::plm(eqn, model = "fd", data = d_plm)
+# fixed-effects
+plm_fe <- plm::plm(eqn, model = "within", data = d_plm)
+```
+
+Inspecting the last model through the usual `summary` function will return something that is broadly similar to what you are used to read after a linear model estimated with the base `lm` function, with a few additional details, and a few less predictors, since the modelling strategy used below (one-way fixed-effects) will remove time-invariant predictors like our `former_colony` variable:
+
+```{r, plm-fe}
+summary(plm_fe)
+```
+
+These models can then be compared by using the same packages that we used last week to visualize model summaries, such as the `texreg` package:
+
+```{r}
+# note: country dummies omitted
+texreg::screenreg(list(plm_lm, plm_lsdv, plm_fd, plm_fe),
+                  custom.model.names = c("Pooled", "LSDV", "FD", "OWFE"),
+                  omit.coef = "ccodealp")
+```
+
+## Standard error corrections
+
+At that stage, we have created model objects on which many operations can be performed, including [regression diagnostics][fe-diagnostics] of the same kind as those that we mentioned last week. However, the most common operation that you will want to perform is to correct the standard errors of the model(s).
+
+[fe-diagnostics]: http://karthur.org/2016/fixed-effects-panel-models-in-r.html
+
+This can be done on-the-fly while looking into a `plm` model object, either through the base `summary` function, or with other packages like the `lmest` package, which implements many standard error corrections. The examples below perform what the literature sometimes refers to as a 'Huber-White' correction, with an additional small-sample correction in the second example that matches what the Stata software performs:
+
+```{r plm-se}
+summary(plm_fe, vcov = plm::vcovHC)
+lmtest::coeftest(plm_fe, function(x) plm::vcovHC(x, type = "sss"))
+```
+
+ANother way to perform these corrections on-the-fly is to use the `modelsummary` package with the `vcov` argument, which does exactly the same thing prior to showing its results. In the example below, we look at the same model in each column, which is why the coefficients are identical, but we ask for three different types of standard errors:
+
+```{r modelsummary-se}
+modelsummary::modelsummary(plm_fe, stars = TRUE, 
+                           vcov = c("classical", "robust", "stata"))
+```
+
+Note the very last line of the table, which reports the corrections (or absence thereof in the first column).
+
+## Fixed-effects estimation with `fixest`
+
+The [`fixest`][fixest] package allows to perform all steps outlined above, but does so through a slightly different, and possibly more flexible, interface. Defining a one-way or two-way fixed-effects equation for that package takes a slightly different form that uses a `|` pipe to specify the clusters:
+
+```{r fixest-equations}
+# one-way fixed-effects
+eqn_fixest_1 <- formula(wdi_fertility ~
+                          wdi_nersf + democratic + former_colony + 
+                          log_gdpc + log_matdeath | ccodealp)
+eqn_fixest_1
+# two-way fixed-effects
+eqn_fixest_2 <- formula(wdi_fertility ~
+                          wdi_nersf + democratic + former_colony + 
+                          log_gdpc + log_matdeath | ccodealp + year)
+eqn_fixest_2
+```
+
+Similarly to what we did with the `plm` package, we can now declare the data to be a panel in the eyes of the package (again, an optional step, but one that might be useful in some contexts):
+
+```{r, fixest-data}
+d_fixest <- fixest::panel(d, ~ ccodealp + year)
+```
+
+And finally, we can now estimate and read our models through similar means as used above when working with the `plm` package:
+
+```{r fixest-models}
+fixest_fe1 <- fixest::feols(eqn_fixest_1, data = d_fixest)
+fixest_fe2 <- fixest::feols(eqn_fixest_2, data = d_fixest)
+modelsummary::modelsummary(list(fixest_fe1, fixest_fe2), stars = TRUE)
+```
+
+You will find it interesting to use the `fixest` package if you are trying to match the standard errors produced by Stata, as the authors of the `fixest` package have gone a long way to match what Stata does. Their [package vignette on standard errors][fixest-se] also explains how to match the results of the `plm` package in great detail.
+
+[fixest-se]: https://lrberge.github.io/fixest/articles/standard_errors.html
+
+Another functionality of the package is to provide a user-friendly syntax to include [interaction terms][fixest-i] in your models.
+
+[fixest-i]: https://lrberge.github.io/fixest/articles/fixest_walkthrough.html#interaction-terms
+
+---
+
+Note that both the `plm` and `fixest` packages can estimate the kinds of _generalized_ linear models (GLMs) that we will introduce in a future session, for when our dependent variable are categorical instead of continuous.

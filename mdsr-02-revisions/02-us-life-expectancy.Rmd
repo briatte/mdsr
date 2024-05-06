@@ -1,0 +1,125 @@
+---
+title: "The downfall of US life expectancy"
+author: "MDSR-02"
+date: "2024-02-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# required packages
+library(countrycode)
+library(rsdmx)
+library(tidyverse)
+```
+
+The goal of this document is to have you revise `tidyverse` functions from `dplyr` and `ggplot2` especially, as we will using both extensively in all forthcoming sessions. In parallel, let's also continue to familiarise ourselves with R Markdown documents.
+
+## Data collection
+
+Let's get [life expectancy data][oecd-lexp] from the OECD. The format is [SDMX][sdmx], so we will need the `rsdmx` package to read it.
+
+[oecd-lexp]: https://data-explorer.oecd.org/vis?tm=life%20expectancy&pg=0&hc[Measure]=Life%20expectancy&snb=12&df[ds]=dsDisseminateFinalDMZ&df[id]=DSD_HEALTH_STAT%40DF_LE&df[ag]=OECD.ELS.HD&df[vs]=1.0&pd=1960%2C2022&dq=AUS%2BAUT%2BBEL%2BCAN%2BCHL%2BCOL%2BCRI%2BCZE%2BDNK%2BEST%2BFIN%2BFRA%2BDEU%2BGRC%2BHUN%2BISL%2BIRL%2BISR%2BITA%2BJPN%2BKOR%2BLVA%2BLTU%2BLUX%2BMEX%2BNLD%2BNZL%2BNOR%2BPOL%2BPRT%2BSVK%2BSVN%2BESP%2BSWE%2BCHE%2BTUR%2BGBR%2BUSA.A.LFEXP..Y0........&ly[rw]=REF_AREA&ly[cl]=TIME_PERIOD&ly[rs]=SEX&to[TIME_PERIOD]=false
+[sdmx]: https://sdmx.org/?page_id=5008
+
+```{r data, cache=TRUE}
+data_url <- "https://sdmx.oecd.org/public/rest/data/OECD.ELS.HD,DSD_HEALTH_STAT@DF_LE,1.0/AUS+AUT+BEL+CAN+CHL+COL+CRI+CZE+DNK+EST+FIN+FRA+DEU+GRC+HUN+ISL+IRL+ISR+ITA+JPN+KOR+LVA+LTU+LUX+MEX+NLD+NZL+NOR+POL+PRT+SVK+SVN+ESP+SWE+CHE+TUR+GBR+USA.A.LFEXP..Y0........?startPeriod=1960&endPeriod=2022"
+
+data_sdmx <- rsdmx::readSDMX(data_url, isURL = TRUE)
+data_df <- as.data.frame(data_sdmx)
+data_tbl <- as_tibble(data_df)
+glimpse(data_tbl)
+```
+__Quick revision__ -- check the classes and structure of all objects created above.
+
+Also note the use of the `cache = TRUE` parameter in the code chunk above. This will create a local copy of the results, and avoid re-downloading the data multiple times if you are going to execute this document more than once.
+
+Let's now clarify which countries are included. We use the `countrycode` package to convert ISO-3C country codes to country names:
+
+```{r countries}
+countrycode::countrycode(unique(data_tbl$REF_AREA), "iso3c", "country.name")
+```
+
+## Data aggregations
+
+Let's now revise how aggregation works. The simplest one consists in averaging life expectancy over years:
+
+```{r by-year}
+group_by(data_tbl, obsTime) %>% 
+  summarise(avg_lexp = mean(obsValue))
+```
+
+A more advanced one will show the same summary statistic by decade. Since `obsTime` is provided in `character` format, we first coerce it to integer, and then compute a decade variable. The next two steps are then very close to those that we took above when averaging over years:
+
+```{r by-decade}
+data_tbl %>% 
+  mutate(year = as.integer(obsTime), decade = 10 * year %/% 10) %>% 
+  group_by(decade) %>% 
+  summarise(avg_lexp = mean(obsValue), sd_lexp = sd(obsValue))
+```
+
+__Quick revision__ -- interpret both output columns (mean and standard deviation). Also make sure that you understand the `dplyr` 'verbs' (functions) used above, as we will use them in many, many situations.
+
+## Trend visualizations
+
+Even though we aggregated everything by year above, the data actually contain three data points per time unit -- one for females (`F`), one for males (`M`), and one for both (`_T`). Let's have a look at all trends, per sex and per country, while also adding an [overall trend line][loess]:
+
+[loess]: https://en.wikipedia.org/wiki/Local_regression
+
+```{r overall-trends}
+ggplot(data_tbl, aes(as.integer(obsTime), obsValue)) +
+  geom_line(aes(group = REF_AREA), color = "grey50") +
+  geom_smooth(linewidth = 1.1, method = "loess", se = FALSE) +
+  facet_wrap(~ SEX)
+```
+
+Let's now work towards a more refined plot. The goal is to compare U.S. average life expectancy to that of the rest of OECD countries:
+
+```{r us-v-rest-1}
+data_tbl %>% 
+  filter(SEX == "_T") %>% 
+  mutate(country_group = if_else(REF_AREA == "USA", "USA", "OECD")) %>% 
+  group_by(obsTime, country_group) %>% 
+  summarise(avg_lexp = mean(obsValue))
+```
+
+We are interested in the difference between values that are currently in a same column (`avg_lexp`), so let's pivot the data to have `OECD` and `USA` values on a same `year` row:
+
+```{r us-v-rest-2}
+usa_v_oecd <- data_tbl %>% 
+  filter(SEX == "_T") %>% 
+  mutate(country_group = if_else(REF_AREA == "USA", "USA", "OECD")) %>% 
+  group_by(obsTime, country_group) %>% 
+  summarise(avg_lexp = mean(obsValue)) %>% 
+  pivot_wider(id_cols = obsTime, 
+              names_from = country_group, 
+              values_from = avg_lexp)
+
+usa_v_oecd
+```
+
+__Quick revision__ -- make sure that you understand how [pivoting][pivot-wider] was used here to 'explode' a variable into multiple columns.
+
+[pivot-wider]: https://r4ds.hadley.nz/data-tidy#widening-data
+
+The resulting data match a dataset used by Kieran Healy [book](https://socviz.co/groupfacettx.html) and [slides](https://visualizingsociety.com/content/04-content.html) on data visualization. Let's reproduce his bar plot of U.S. life expectancy over time:
+
+```{r us-v-rest-3}
+ggplot(data = mutate(usa_v_oecd, diff = USA - OECD), 
+       mapping = aes(x = as.integer(obsTime), y = diff, fill = diff > 0)) +
+  geom_col() + 
+  geom_hline(yintercept = 0, size = 1.2) + 
+  guides(fill = "none") + 
+  labs(x = NULL, 
+       y = "Difference in years", 
+       title = "The U.S. life expectancy gap", 
+       subtitle = str_c("Difference between U.S. and OECD average life ",
+                        "expectancies, 1960-2015"),
+       caption = "Data: OECD. Graph initially coded by Kieran Healy.") +
+  theme_bw()
+```
+
+__Quick revision__ -- make sure that you understand how `ggplot2` works! [Kieran Healy's book][socviz] is a good starting point, and I can also refer you to the session on visualization from last semester. If you need to revise other `tidyverse` functions, some other sessions from last term might come in handy.
+
+[socviz]: https://socviz.co/

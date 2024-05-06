@@ -1,3 +1,7 @@
+DRAFT-*
+*.html
+*.webloc
+
 # History files
 .Rhistory
 .Rapp.history

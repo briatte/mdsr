@@ -1,0 +1,392 @@
+---
+title: "Attitudes towards EU integration and migration in Britain and France, c. 2014"
+author: "FB"
+date: "2024-03-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This document uses an extract of the [European Social Survey][ess] to illustrate the use of survey weights. This is complex topic, especially when it comes to the use of [survey weights in regression modelling][gelman07].
+
+[ess]: https://europeansocialsurvey.org/
+[gelman07]: https://doi.org/10.1214/088342306000000691
+
+In terms of packages, we will mostly use the [`survey` package][survey], which provides all the different functions that we will need to apply survey weights, and then to conduct common operations ranging from descriptive statistics to regression modelling.
+
+[survey]: https://cran.r-project.org/package=survey
+
+Another useful package for survey analysis is the [`srvyr` package][srvyr], which provides pipe-compatible functions to replicate what `survey` does within a tidyverse/`dplyr`-style coding style.
+
+[srvyr]: https://cran.r-project.org/package=srvyr
+
+```{r packages, message = FALSE}
+library(haven)
+library(tidyverse)
+
+# survey-weighted functions
+library(srvyr)
+library(survey)
+
+# usual helpers for regression models
+library(broom)
+library(modelsummary)
+```
+
+Note that we also load the `haven` package, as we will work with a Stata version of the data. Survey data in SPSS or Stata often come with variable and value labels, which are easily accessible through the functions of the `haven` package, or through more advanced packages like the `labelled` package.
+
+## Data
+
+Our data come from Round 7 of the [European Social Survey][ess] (ESS), which was collected in 2014. The data contain only a small extract of all available variables, and are limited to British and French respondents.
+
+```{r load-ess}
+# load the data extract
+ess7 <- haven::read_dta("data/ess2014-extract.dta")
+
+# data overview
+glimpse(ess7)
+
+# selected country samples
+count(ess7, cntry)
+```
+
+The ESS website provides an enormous amount of technical documentation for each round of the survey. The [section for Round 7][ess7] contains two essential documents: (1) the [codebook][codebook], which lists all variable names and values, and (2) the [weighting guide][weighting-guide].
+
+[ess7]: https://ess.sikt.no/en/study/ccd56840-e949-4320-945a-927c49e1dc4f/116
+[codebook]: https://stessrelpubprodwe.blob.core.windows.net/data/round7/survey/ESS7_appendix_a7_e01_0.pdf
+[weighting-guide]: https://stessrelpubprodwe.blob.core.windows.net/data/methodology/ESS_weighting_data_1_2.pdf
+
+### Data preparation
+
+Survey data often requires taking many preparation steps prior to analysis, such as recoding missing values or recoding categorical variables to fewer groups.
+
+The first step that we take below is purely technical, and serves only to illustrate survey weighting in what follows. (The step comes from [a coded example by Anthony Damico](https://asdfree.com/european-social-survey-ess.html).)
+
+```{r one}
+ess7$one <- 1L
+```
+
+The next steps are more meaningful. We start with socio-demographics, by recoding age into age groups and sex into a male/female factor variable, and then into a binary (dummy) variable:
+
+```{r data-preparation}
+ess7 <- ess7 %>% 
+  mutate(
+    age4 = cut(agea, c(18, 25, 45, 65, Inf), right = FALSE) %>%
+      factor(labels = c("18-24", "25-44", "45-64", "65+")),
+    gndr = haven::as_factor(gndr) %>% 
+      droplevels(),
+    female = case_when(
+      gndr == "Male" ~ 0,
+      gndr == "Female" ~ 1,
+      .default = NA
+    )
+  )
+```
+
+The code above contains a mix of base functions and of `dplyr` functions, and two of the functions used have to do with converting variables into factors. If you have not yet done so, make sure to revise [how factors work](https://r4ds.hadley.nz/factors.html) before engaging in survey data analysis, which will frequently require using them.
+
+The next steps that we take show how to reverse-code a variable measured on a 11-point scale, and how to get rid of missing values such as `77`, `88` and `99`, or any other value that might typically be located at the end of the values of a given variable:
+
+```{r data-preparation-2}
+ess7 <- ess7 %>% 
+  mutate(
+    #
+    # attitudes towards EU integration
+    # (0 = gone too far, 10 = go further)
+    # haven::print_labels(ess7$euftf)
+    euftf = if_else(euftf > 10, NA, euftf),
+    more_eu = as.integer(euftf),
+    less_eu = 10 - more_eu,
+    #
+    # voted in the last election
+    # (1 = yes, 2 = no, 3 = not eligible)
+    # haven::print_labels(ess7$vote)
+    voted = case_when(
+      vote == 1 ~ 1,
+      vote == 2 ~ 0,
+      .default = NA
+    )
+  )
+```
+
+As a final example, the code below shows how to encode the missing values of the `hincfel` variable before turning it into a labelled factor, which we then strip of its unused levels:
+
+```{r data-preparation-3}
+ess7 <- ess7 %>% 
+  mutate(
+    # subjective income
+    # (1 = comfortable, 4 = very difficult)
+    # haven::print_labels(ess7$hincfel)
+    subj_income = if_else(hincfel > 4, NA, hincfel) %>% 
+      haven::as_factor() %>% 
+      forcats::fct_drop()
+  )
+```
+
+The last function used above comes from the [`forcats` package][forcats], which provides many handy functions to manipulate factor variables. The function dropped the "Refusal", "Don't know" and "No answer" levels of the variable, which we will not be using later on. The function is broadly equivalent to the base `droplevels` function that we use earlier.
+
+[forcats]: https://forcats.tidyverse.org/
+
+Note that factor levels can be directly modified if need be, as follows:
+
+```{r factor-levels}
+# `hincfel` variable, full list of factor levels after conversion
+levels(haven::as_factor(ess7$hincfel))
+# `subj_income` variable, full list of factor levels
+levels(ess7$subj_income)
+# direct modification of the levels through the `levels` function
+levels(ess7$subj_income) <- levels(ess7$subj_income) %>% 
+  str_remove(" on present income")
+# result
+levels(ess7$subj_income)
+```
+
+Factor levels are interesting to manipulate and 'clean up' as we did because they will show up later in our regression models.
+
+### Survey design
+
+Let's now turn to the survey weights. The data come with several variables that are meant to be used in that context:
+
+```{r weighting-vars}
+ess7 %>% 
+  select(idno, cntry, matches("weight|wght")) %>% 
+  glimpse()
+```
+
+The respondent identification numbers (`idno`) will serve as our 'Primary Sampling Unit' (PSU). These units are 'nested' into two different countries (`cntry`), where they had a slightly unequal chance to be sampled due to different selection probabilities, sampling error, and non-response bias.
+
+To adjust for that, the ESS provides the `pspwght` (post-stratification weights) variable, which might be used to bring our sample closer to a simple random sample. This will provide more accurate standard errors, at the expense of slightly more complex code.
+
+Let's declare the information above by embedding our data into a __survey design object__, which can be designed as follows using the `survey` package:
+
+```{r survey-design}
+ess_design <- survey::svydesign(
+  ids = ~ idno,
+  strata = ~ cntry,
+  nest = TRUE,
+  weights = ~ pspwght,
+  data = ess7
+)
+```
+
+This survey object can be updated if necessary, for instance if you need to modify a variable within it:
+
+```{r survey-object-update}
+ess_design <- ess_design %>% 
+  update(
+    #
+    # attitudes towards non-EU migrants from poor countries
+    # (1 = allow many, 4 = allow none)
+    eimpcnt = if_else(eimpcnt > 4, NA, eimpcnt),
+    no_migrants = case_when(
+      eimpcnt %in% 1:2 ~ 0,
+      eimpcnt %in% 3:4 ~ 1,
+      .default = NA
+    )
+)
+```
+
+Also note that the same survey design object can be created with the `srvyr` package, using a slightly different syntax that does not use formula notation:
+
+```{r survey-design-srvyr}
+# using the {srvyr} package
+ess_srvyr <- ess7 %>% 
+  srvyr::as_survey_design(
+    ids = idno,
+    strata = cntry,
+    nest = TRUE,
+    weights = pspwght
+  )
+```
+
+All code that follows is based on the `survey` package, but you will want to explore the `srvyr` package if you are interested in its simpler syntax, which can also be useful to [plot your survey-weighted results][srvyr-vignette] using `ggplot2`.
+
+[srvyr-vignette]: https://cran.r-project.org/web/packages/srvyr/vignettes/srvyr-vs-survey.html
+
+Both survey design objects created above contain a copy of the ESS data, plus information on how to apply survey weights to it. In all our code below, we will refer to that `ess_design` survey object, rather than to the original 'unweighted' `ess7` data frame, in order to take advantage of these weights.
+
+Note that the [ESS weighting guide][weighting-guide] contains guidance on the other `dweight` and `pweight` variables, which are useful in different contexts. That same guide also recommends creating 'analytical' weights, which are slightly different to what we did above, but which will return very similar estimates of survey-weighted quantities.
+
+Last, note that survey design objects can be subset in the same way that data frames can, as in the code chunk below, which creates a separate survey design object for both our countries of interest:
+
+```{r survey-object-subset}
+ess_fr <- subset(ess_design, cntry == "FR")
+ess_gb <- subset(ess_design, cntry == "GB")
+```
+
+## Survey-weighted functions
+
+The survey package provides many functions meant to be used on survey design objects. The ones shown below simply return the total number of observations, overall and for each country in the data:
+
+```{r survey-functions-1, warning = FALSE}
+# weighted count
+survey::svytotal(~ one, ess_design)
+# weighted count, by country
+survey::svyby(~ one, ~ cntry, ess_design, svytotal)
+# unweighted count, by country
+survey::svyby(~ one, ~ cntry, ess_design, unwtd.count)
+```
+
+The same syntax can be used to obtain means and proportions:
+
+```{r weighted-means, warning = FALSE}
+# attitudes towards EU integration
+svyby(~ euftf, ~ cntry, ess_design, svymean, na.rm = TRUE)
+# proportion of males and females
+svyby(~ gndr, ~ cntry, ess_design, svymean, na.rm = TRUE)
+# attitudes towards EU integration, by country + sex subgroups
+svyby(~ euftf, ~ gndr + cntry, ess_design, svymean, na.rm = TRUE)
+```
+
+There are many more survey-weighted functions, such as `svyvar` for variance and `svyratio` to compute ratios of two variables. All functions follow the same base syntax shown above:
+
+```{r more-weighted-funs, warning = FALSE}
+svyby(~ more_eu, ~ gndr + cntry, ess_design, svyquantile, 0.5, na.rm = TRUE)
+```
+
+Also note that each component of the survey-weighted results can be extracted through one of the following helper functions, which also allow to get confidence intervals:
+
+```{r svy-extractors, warning = FALSE}
+# example survey-weighted means
+ex_means <- svyby(~ euftf, ~ gndr + cntry, ess_design, svymean, na.rm = TRUE)
+
+# point estimates
+coef(ex_means)
+# standard errors
+survey::SE(ex_means)
+# 95% confidence intervals
+confint(ex_means)
+```
+
+### Plotting survey-weighted results
+
+Extracting some of your results as performed above can be handy if you are interested in plotting the estimated quantities, although in that case, I would recommend switching to the `srvyr` package, which returns its results as nice little tibbles that can easily be fed into a `ggplot` function for that purpose:
+
+```{r srvyr-plot}
+ess_srvyr %>% 
+  group_by(cntry, gndr) %>% 
+  summarise(prop = survey_mean(euftf, na.rm = TRUE, vartype = "ci")) %>% 
+  ggplot(aes(x = gndr, y = prop)) +
+    geom_col(aes(fill = gndr)) +
+    geom_errorbar(aes(ymin = prop_low, ymax = prop_upp), width = 0.2) +
+    facet_wrap(~ cntry) +
+    theme_linedraw()
+```
+
+In the code above, the `survey_mean` function from the `srvyr` package provides the same results as the `svymean` function of the `survey` function, and its `vartype` argument provides a 95% CI instead of providing the standard error, which is its default behaviour.
+
+### Confidence intervals for proportions
+
+Finally, note that confidence intervals for proportions can be computed in slightly more accurate ways than by treating proportions as means, as we did earlier. The function to get these slightly better estimates is shown below:
+
+```{r svyciprop, warning = FALSE}
+survey::svyciprop(~ voted, ess_fr, method = "likelihood", na.rm = TRUE)
+survey::svyciprop(~ voted, ess_gb, method = "likelihood", na.rm = TRUE)
+```
+
+## Survey-weighted _t_-tests and linear models
+
+Survey-weighted functions also exist for association tests, and of course, for linear models. The results of a survey-weighted _t_-test will come in exactly the same format as that of an unweighted one:
+
+```{r ttest, warning = FALSE}
+survey::svyttest(euftf ~ gndr, ess_fr)
+survey::svyttest(euftf ~ gndr, ess_gb)
+```
+
+Similarly, a survey-weighted linear model will look exactly like an unweighted one. The only difference is that instead of the `lm` function, the `survey` package will require using the `svyglm` function, where the `g` in the function name means "generalized".
+
+The default estimator of that function is a Gaussian distribution, which will return the results of a linear model:
+
+```{r ols-models, warning = FALSE}
+# model equation
+ols_eqn <- formula(euftf ~ age4 + gndr + subj_income)
+
+# model objects
+ols_fr <- survey::svyglm(ols_eqn, ess_fr)
+ols_gb <- survey::svyglm(ols_eqn, ess_gb)
+```
+
+Survey-weighted models are supported by the `modelsummary` package, which means that we can pass them to its main function and get the same kind of results table as we are now used to:
+
+```{r ols-results, warning = FALSE}
+modelsummary::modelsummary(list("FR" = ols_fr, "GB" = ols_gb), stars = TRUE)
+```
+
+On top of that, note that survey-weighted linear models produce residuals that can be passed to the `broom` package, which means that you can use many of the regression diagnostics from our session on linear models:
+
+```{r ols-residuals, warning = FALSE}
+# distribution of the residuals
+hist(residuals(ols_fr))
+hist(residuals(ols_gb))
+
+# ... or as values, using the {broom} package
+broom::augment(ols_fr) %>% 
+  glimpse()
+```
+
+Note how the `broom` package copies all model variables to the result of its `augment` function, which means that you do not need to provide the original data frame through the `data` or `newdata` argument, as we did in Session 5.
+
+## Survey-weighted logistic regression models
+
+Let's close by looking at a different kind of model -- logistic regression. First, note the unsatisfactory diagnostics of a linear model when the dependent variable comes as a binary variable:
+
+```{r binary-dv}
+naive_ols <- svyglm(no_migrants ~ agea + gndr + subj_income, ess_fr)
+summary(naive_ols)
+hist(residuals(naive_ols))
+```
+
+For this kind of dependent variable, instead of a linear model, switch to a non-linear one that supports binary dependent variables, i.e. __logistic regression__, where the model equation becomes
+
+$$Pr(Y = 1) = \frac{exp(\beta_0 + \beta_1 X_1 + \beta_2 X_2 + \epsilon)}
+{1 + exp(\beta_0 + \beta_1 X_1 + \beta_2 X_2 + \epsilon)}$$
+
+Note that the equation is nothing else but a linear model contained within a 'link' function (the 'logit' function). The trick consists in expressing your dependent variable as its __odds__ of being true:
+
+$$\phi (Y = 1) = \frac{P(Y=1)}{1-P(Y=1)} \in [0, + \infty)$$
+
+... and then to get a linear estimator for that quantity:
+
+$$L = \ln \phi = \ln \bigg( \frac{P}{1-P} \bigg) \in (-\infty, +\infty)$$
+
+The estimator will return __log-odds__, which can be translated back into probabilities:
+
+$$p (L) = \frac{1}{1 + e^{-L}}$$
+
+... as in $p(L = -2.4) = \frac{1}{1 + e^{-(-2.4)}} = 0.084$, or $p(L = +3.1) = \frac{1}{1 + e^{-3.1}} = 0.957$.
+
+A simpler way to read the same results is to exponentiate them, which will return __odds-ratios:__
+
+$$OR = \frac{\textrm{odds after a unit change in } X}{\textrm{original odds}}$$
+
+Estimating this kind of _generalized_ linear model uses the same survey-weighted function that we used earlier, except with a different `family` argument:
+
+```{r svyglm, warning = FALSE}
+# model equation
+logit_eqn <- formula(no_migrants ~ age4 + gndr + subj_income)
+
+logit_fr <- survey::svyglm(logit_eqn, family = quasibinomial(), ess_fr)
+logit_gb <- survey::svyglm(logit_eqn, family = quasibinomial(), ess_gb)
+
+# as log-odds and as odds-ratios
+modelsummary::modelsummary(list("FR" = logit_fr, "FR (OR)" = logit_fr, 
+                                "GB" = logit_gb, "GB (OR)" = logit_gb),
+                           stars = TRUE, exponentiate = c(F, T, F, T))
+```
+
+The 'quasi' in 'quasi-binomial' is a way to avoid a warning about non-integer success when using `svyglm`.
+
+Note that yet another way to model the same variable on attitudes towards migration (`eimpcnt`) would consist in using the original coding of the variable on a 4-point scale, and to use __ordinal logistic regression:__
+
+```{r ologit, warning = FALSE}
+# model equation
+ologit_eqn <- formula(factor(eimpcnt) ~ age4 + gndr + subj_income)
+
+ologit_fr <- survey::svyolr(ologit_eqn, ess_fr)
+ologit_gb <- survey::svyolr(ologit_eqn, ess_gb)
+
+modelsummary::modelsummary(list("FR" = ologit_fr, "GB" = ologit_gb),
+                           stars = TRUE, exponentiate = TRUE)
+```

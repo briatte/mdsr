@@ -1,0 +1,228 @@
+---
+title: "Air pollution, PM2.5 mean annual exposure (micrograms per cubic meter), 2019"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    theme:
+      version: 4
+      # bg: "#101010"
+      # fg: "#FDF7F7" 
+      primary: "#0054AD"
+---
+
+```{r packages, echo = FALSE, warning = FALSE, message = FALSE}
+# dashboard packages
+library(DT)
+library(flexdashboard)
+library(leaflet)
+
+# data manipulation
+library(sf)
+library(tidyverse)
+
+# model manipulation
+library(insight)
+library(lme4)
+library(performance)
+library(parameters)
+```
+
+```{r data, echo = FALSE, message = FALSE}
+# geographical data
+map <- sf::st_read("data/WB_countries_Admin0_lowres.geojson", quiet = TRUE)
+# glimpse(map)
+
+# fix an issue with the ISO-A3 country code of Norway
+map$ISO_A3_EH[ map$NAME_EN == "Norway" ] <- "NOR"
+
+# air pollution data
+pollution <- "data/API_EN.ATM.PM25.MC.M3_DS2_en_csv_v2_42623.csv" %>% 
+  readr::read_csv(skip = 3, col_types = cols()) %>% 
+  select(ISO3 = `Country Code`, NAME = `Country Name`, PM2.5 = `2019`)
+
+# add pollution column to geographical data
+map$PM2.5 <- pollution[ match(map$ISO_A3_EH, pollution$ISO3), ]$PM2.5
+
+# note: the `match` method above preserves the `sf` class of the `map` object,
+# which is required to use it as a source for the map; the class will be lost
+# if you use a merge function such as dplyr::full_join instead
+```
+
+```{r model, echo = FALSE, message = FALSE}
+# example model
+formula <- PM2.5 ~ scale(GDP_MD_EST) + scale(POP_EST) + (1 | REGION_WB)
+model <- lme4::lmer(formula, data = map)
+# modelsummary::modelsummary(model)
+```
+
+<!-- PAGE 1 LEFT ---------------------------------------------------------------
+     = map and diagnostics -->
+
+Map
+=====================================
+
+Column {.tabset data-width=850}
+-------------------------------------
+
+### Air pollution
+
+```{r map}
+# create color palette
+color_palette <- leaflet::colorBin(
+  palette = "plasma",
+  domain = map$PM2.5,
+  bins = seq(0, max(map$PM2.5, na.rm = TRUE) + 10, by = 10)
+)
+
+# create mouse-hover labels
+map$labels <- str_c("<strong>Country:</strong> ", map$NAME_EN,
+                    "<br/>",
+                    "<strong>PM2.5:</strong> ", round(map$PM2.5, 1),
+                    "<br/>") %>%
+  map(htmltools::HTML)
+
+# create map
+leaflet::leaflet(map) %>%
+  leaflet::addTiles() %>%
+  leaflet::setView(lng = 0, lat = 30, zoom = 2) %>%
+  leaflet::addPolygons(
+    fillColor = ~ color_palette(PM2.5),
+    color = "white",
+    fillOpacity = 0.7,
+    label = ~ labels,
+    highlight = leaflet::highlightOptions(color = "black",
+                                          bringToFront = TRUE)
+  ) %>%
+  leaflet::addLegend(pal = color_palette,
+                     values = ~ PM2.5,
+                     opacity = 0.7,
+                     title = "PM2.5")
+```
+
+### World Bank regions
+
+```{r static-map, fig.width = 8}
+ggplot(map) + 
+  geom_sf(aes(fill = REGION_WB)) +
+  coord_sf(crs = "WGS84") +
+  scale_fill_discrete("") +
+  theme(legend.position = "bottom",
+        plot.background = element_blank())
+```
+
+### Diagnostics
+
+```{r diagnostics, fig.height = 10, fig.width = 10}
+performance::check_model(model, verbose = FALSE)
+```
+
+<!-- PAGE 1 RIGHT --------------------------------------------------------------
+     = summary tables -->
+
+Column {.tabset}
+-------------------------------------
+
+### Countries
+
+```{r by_country}
+DT::datatable(
+  as_tibble(map) %>% 
+    select(ISO = ISO_A3_EH, Country = NAME_EN, PM2.5) %>% 
+    mutate(PM2.5 = round(PM2.5, 2)),
+  rownames = FALSE, options = list(pageLength = 11)
+)
+```   
+
+### By continent
+
+```{r by_continent}
+as_tibble(map) %>% 
+  select(Continent = REGION_UN, PM2.5) %>% 
+  group_by(Continent) %>% 
+  summarise(n = n(),
+            mean = mean(PM2.5, na.rm = TRUE),
+            min = min(PM2.5, na.rm = TRUE),
+            max = max(PM2.5, na.rm = TRUE)) %>% 
+  filter(!is.na(mean)) %>% 
+  mutate_if(is.numeric, round, 2) %>% 
+  DT::datatable(rownames = FALSE, autoHideNavigation = TRUE)
+```
+
+### By World Bank region
+
+```{r by_region}
+as_tibble(map) %>% 
+  select(Subregion = REGION_WB, PM2.5) %>% 
+  group_by(Subregion) %>% 
+  summarise(n = n(),
+            mean = mean(PM2.5, na.rm = TRUE),
+            min = min(PM2.5, na.rm = TRUE),
+            max = max(PM2.5, na.rm = TRUE)) %>% 
+  filter(!is.na(mean)) %>% 
+  mutate_if(is.numeric, round, 2) %>% 
+  DT::datatable(rownames = FALSE, autoHideNavigation = TRUE)
+```
+
+### Mixed model
+
+Fitting the following [mixed-effects model][mixed] to `r nobs(model)` countries, with both predictors rescaled and assuming $\mathrm{effect}_{\mathrm{region}} \sim \mathcal{N}(0, \sigma)$ (random region effects):
+
+$$\mathrm{PM2.5} = (\beta_0 + \mathrm{effect}_{\mathrm{region}}) + \beta_1 \mathrm{GDP/cap.} + \beta_2 \mathrm{Population} + \epsilon$$
+
+__N.B.__ This is very much an example model, not a suggested way of modelling air pollution at the country-level.
+
+[mixed]: https://m-clark.github.io/mixed-models-with-R/random_intercepts.html
+
+```{r model-tables, message = FALSE}
+parameters::parameters(model, verbose = FALSE) %>% 
+  print_md(caption = NULL)
+
+performance::performance(model) %>% 
+  print_md(layout = "horizontal", caption = "# Performance metrics")
+```
+
+<!-- PAGE 2 --------------------------------------------------------------------
+     = sources -->
+
+Sources
+=====================================
+
+Column {data-width=200}
+-------------------------------------
+
+### Data
+
+The __`WB_countries_Admin0_lowres.geojson`__ [GeoJSON][geojson] file contains version 1 of the [administrative boundaries][wb-boundaries] used by the World Bank to represent countries.
+
+You might notice a few disputed areas by zooming on e.g. the Western Sahara, or a few missing countries such as Kosovo (World Bank code `KSV`, ISO-A3 country code `XKX`).
+
+[geojson]: https://geojson.org/
+[wb-boundaries]: https://datacatalog.worldbank.org/search/dataset/0038272/World%20Bank%20Official%20Boundaries?version=1
+
+The __`EN.ATM.PM25.MC.M3`__ CSV file also comes [from the World Bank](https://data.worldbank.org/indicator/EN.ATM.PM25.MC.M3).
+
+The map displays data for year 2019 because it is the most recent year for which PM2.5 data are currently available.
+
+Column {data-width=200}
+-------------------------------------
+
+### Code
+
+This dashboard is based on example code by __Paul Moraga__, as provided in [chapter 12](https://www.paulamoraga.com/book-geospatial/sec-flexdashboard.html) of his book _[Geospatial Health Data: Modeling and Visualization with R-INLA and Shiny](https://www.paulamoraga.com/book-geospatial/index.html)_ (2019).
+
+I very much recommend the book to anyone who wants to learn __geospatial analysis__ in R. Paul Moraga has also authored another book on the topic, _[Spatial Statistics for Data Science: Theory and Practice with R](https://www.paulamoraga.com/book-spatial/)_ (2023), which is also free to read online.
+
+You will find more on the topic of geospatial analysis in [Section 12 (Extensions)](https://github.com/briatte/dsr/wiki/readings#12-extensions) section of the _Data Science with R_ wiki.
+
+Column {data-width=200}
+-------------------------------------
+
+### Packages
+
+The __dashboard__ in this example is produced by the [`flexdashboard` package](https://pkgs.rstudio.com/flexdashboard), which itself relies on [R Markdown](https://rmarkdown.rstudio.com/) and on the [Bootstrap CSS framework](https://pkgs.rstudio.com/flexdashboard/articles/theme.html).
+
+Most of the layout settings and options used in this example, such as [tabsets](https://pkgs.rstudio.com/flexdashboard/articles/using.html#tabsets) and [creating multiple pages](https://pkgs.rstudio.com/flexdashboard/articles/using.html#multiple-pages), are documented in the [main vignette](https://pkgs.rstudio.com/flexdashboard/articles/using.html) of the package.
+
+The __map__ in the dashboard is powered by the [`leaflet` package](https://rstudio.github.io/leaflet), which relies on the [Leaflet](https://leafletjs.com/) JavaScript library.
+
+The __tables__ in the dashboard are powered by the [`DT` package](https://rstudio.github.io/DT), which relies on the [DataTables](https://datatables.net/) JavaScript library.

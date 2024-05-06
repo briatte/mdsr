@@ -1,0 +1,223 @@
+---
+title: "Worldwide nuclear reactors"
+author: "MDSR-04"
+date: "2024-02-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This demo shows how to download information from the [Power Reactor Information System (PRIS) database][pris], which is maintained by the [International Atomic Energy Agency (IAEA)][iaea] The database lists all (known?) nuclear reactors.
+
+[pris]: https://pris.iaea.org
+[iaea]: https://iaea.org
+
+We will need the wonderful `rvest` package for what follows, as well as the associated `httr` and `xml2` packages, which will be automatically loaded with it:
+
+```{r packages}
+library(rvest)
+library(tidyverse)
+```
+
+## Getting a Web page in memory
+
+Let's start by making a copy of the [country index][pris-countries], from which we will get all country pages afterwards. The code is written in such a way that the Web page will be downloaded only once, directly into an R object, rather than in an actual file on your hard drive.
+
+[pris-countries]: https://pris.iaea.org/PRIS/CountryStatistics/CountryStatisticsLandingPage.aspx
+
+```{r get-page}
+# base URL of the IAEA PRIS database (a sub-domain)
+base_url <- "https://pris.iaea.org"
+
+# compose the URL to the target Web page
+page_url <- str_c(
+  base_url,
+  "/PRIS/CountryStatistics/",
+  "CountryStatisticsLandingPage.aspx"
+)
+
+# the actual Web page URL (a Web address)
+page_url
+
+# now get the Web page if needed
+if (!exists("web_page")) {
+  web_page <- httr::GET(page_url)
+}
+
+# inspect result header and first lines
+web_page
+```
+
+## Inspecting a Web page
+
+Let's now dive into the results. I recommend opening the HTML source of the Web page in your browser, and check what we are inspecting with the code below directly into the source. The `#` symbol designates the [`id`][id] attribute, whereas the [`ul`][ul], [`li`][li] and `a` tags are HTML tags.
+
+[id]: https://www.w3schools.com/html/html_id.asp
+[ul]: https://www.w3schools.com/tags/tag_ul.asp
+[li]: https://www.w3schools.com/tags/tag_li.asp
+[a]: https://www.w3schools.com/tags/tag_a.asp
+
+```{r get-countries}
+# the divider that we want, queried through CSSSelect
+rvest::read_html(web_page) %>% 
+  rvest::html_node("#sidebar-first")
+
+# the list items within the unordered list that we want
+rvest::read_html(web_page) %>% 
+  rvest::html_nodes("#sidebar-first ul li") %>% 
+  head()
+
+# the links that we want
+rvest::read_html(web_page) %>% 
+  rvest::html_nodes("#sidebar-first ul li a") %>% 
+  head()
+
+# the actual links (hypertext references) that we want
+rvest::read_html(web_page) %>% 
+  rvest::html_nodes("#sidebar-first ul li a") %>% 
+  rvest::html_attr("href") %>% 
+  head()
+```
+
+The results above are all obtained by querying the [DOM][dom] via [CSSSelect][cssselect] (CSS selectors). Another way to inspect the DOM is to use [XPath][xpath] syntax, as we do below to obtain the same result in a more controlled way:
+
+[dom]: https://en.wikipedia.org/wiki/Document_Object_Model
+[cssselect]: https://www.w3.org/TR/selectors-3/
+[xpath]: https://www.w3schools.com/xml/xpath_intro.asp
+
+```{r xpath}
+# a slightly better approach, using some XPath syntax
+web_links <- rvest::read_html(web_page) %>% 
+  rvest::html_nodes("#sidebar-first ul li") %>% 
+  map(rvest::html_node, xpath = ".//a[contains(@href, 'CountryDetails')]") %>% 
+  map_chr(rvest::html_attr, "href")
+```
+
+## Downloading Web pages
+
+Our next step is to download the Web pages at the addresses that we just extracted from the 'index' page. The loop below assumes that there will be no issues during download. The only precaution that we take is to leave two seconds between each download in order to avoid overloading the IAEA server with rapid requests.
+
+```{r download-country-pages}
+# create data/ folder if necessary
+fs::dir_create("data")
+
+# loop over links and download each Web page
+for (i in na.omit(web_links)) {
+  
+  # extract country code
+  cty_code <- str_sub(i, -2)
+  cat("Downloading Web page for country", cty_code)
+  
+  offline_page <- str_c("data/country-", cty_code, ".html")
+  if (!fs::file_exists(offline_page)) {
+    
+    download.file(str_c(base_url, i), offline_page, mode = "wb", quiet = TRUE)
+    cat(" (done, waiting 2 secs...)\n")
+    Sys.sleep(2)
+    
+  } else {
+    cat(" (already done, skipping)\n")
+  }
+  
+}
+cat("We're done!\n")
+```
+
+___Note___ that this example is provided to you with all Web page pre-downloaded, in order to avoid having the entire class download the data at the same time!
+
+## Data extraction
+
+We now go deeper into the Web pages that we downloaded, in order to understand where the data that we are interested in lie within the pages. The trick that we use consists in locating a header (`<h3>`) located within the table that we are interested in, and then moving 'up' from that header to the actual table (`<table>`), by moving up the DOM:
+
+```{r inspect-argentina}
+example_page <- rvest::read_html("data/country-AR.html")
+
+# find the 'Reactors' header
+example_page %>% 
+  rvest::html_nodes(xpath = "//h3")
+
+# go 'up' two levels in the DOM tree
+example_page %>% 
+  rvest::html_nodes(xpath = "//h3/../..")
+
+# select only the second one, and turn it into a proper table
+example_page %>% 
+  rvest::html_nodes(xpath = "//h3/../..") %>% 
+  purrr::pluck(2) %>% 
+  rvest::html_table()
+```
+
+Assuming that each page holds the same data at the same location, we then loop through the downloaded pages, asking for the same content, and collecting all results into a 'master' data frame:
+
+```{r loop-over-pages}
+# create an empty data frame
+reactors <- tibble::tibble()
+
+# list all downloaded Web pages
+offline_pages <- fs::dir_ls("data", glob = "*.html")
+
+# loop over them and extract reactors
+for (i in offline_pages) {
+  cat("Scraping content from", i)
+  
+  cty_reactors <- rvest::read_html(i) %>% 
+    rvest::html_nodes(xpath = "//h3/../..") %>% 
+    purrr::pluck(2) %>% 
+    rvest::html_table()
+  
+  cat(": found", nrow(cty_reactors), "reactor(s)\n")
+  
+  # add a country column
+  cty_reactors <- tibble::add_column(cty_reactors, country = i, .before = 1)
+  
+  # add to master data frame
+  reactors <- dplyr::bind_rows(reactors, cty_reactors)
+  
+}
+cat("We're done!\n")
+```
+
+The operation above is highly error-prone, and would break if the Web pages were to differ in any way from one to the next. This can be handled, just like download issues could also have been handled, through [`try` calls][try].
+
+[try]: https://stat.ethz.ch/R-manual/R-devel/library/base/html/try.html
+
+## Data finalization
+
+We can now clean up the result:
+
+```{r clean-up-data}
+# current master data
+glimpse(reactors)
+
+# messy column names!
+names(reactors)
+# fix this
+names(reactors) <- c("country", "reactor", "type", "status", "location",
+                     "ref_mw", "gross_mw", "first_con")
+
+# minimal data cleaning steps
+reactors <- reactors %>% 
+  mutate(country = str_extract(country, "[A-Z]{2}"),
+         first_con = as.Date(first_con))
+```
+
+And finally, let's inspect the dataset that we scraped from the IAEA:
+
+```{r inspect-data}
+# observations and countries
+nrow(reactors)
+table(reactors$country)
+
+# oldest reactor date
+min(reactors$first_con, na.rm = TRUE)
+# reactors types
+count(reactors, type, sort = TRUE)
+# reactors statuses
+count(reactors, status)
+```
+
+---
+
+__As an optional exercise,__ try extracting any other information from the Web page, such as total electricity production, or the share of nuclear production in that amount. This is a _much harder_ exercise that requires some background in manipulating HTML, CSS and possibly even JavaScript information, which is why I am only posting this suggestion here and not in the slides.
