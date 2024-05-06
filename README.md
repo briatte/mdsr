@@ -12,6 +12,27 @@ A follow-up to an [introduction to data science][dsr] with [R][r], [RStudio][rst
 
 __N.B.__ -- the current repo does not include the full set of datasets used during the semester, which are all publicly available. Future versions will include the full data and slides.
 
+# Outline
+
+1. [Software](#1-software)
+2. [Revisions](#2-revisions)
+3. [SQL databases](#3-sql-databases)
+4. [Web scraping](#4-web-scraping)
+5. [Linear models](#5-linear-models)
+6. [Panel data](#6-panel-data)
+7. [Survey data](#7-survey-data)
+8. [Feedback](#8-feedback)
+9. [Multilevel data](#9-multilevel-data)
+10. [Machine learning in R](#10-machine-learning-in-r)
+11. [Machine learning in Python](#11-machine-learning-in-python)
+12. [Dashboards](#12-dashboards)
+
+Bonus sections:
+
+- [Dependencies](#dependencies)
+- [Credits](#credits)
+- [Elsewhere](#elsewhere)
+
 ## 1. Software
 
 - R and RStudio
@@ -134,9 +155,9 @@ Feedback on your first drafts, and recommendations for the coming weeks.
 
 [d12]: https://github.com/briatte/mdsr/tree/master/mdsr-12-dashboards
 
----
+* * *
 
-# Packages
+# Dependencies
 
 ```r
 pkg_data <- c("countrycode", "rsdmx", "RSQLite", "sf", "tidyverse")
@@ -151,3 +172,14 @@ for (i in c(pkg_data, pkg_models, pkg_tables, pkg_varia)) {
   remotes::install_cran(i)
 }
 ```
+
+# Credits
+
+The [DSR README][dsr] has a list of relevant credits.
+
+# Elsewhere
+
+- [DSR][dsr]
+- [Other similar courses](https://github.com/briatte/dsr/wiki/elsewhere)
+
+More to come.
